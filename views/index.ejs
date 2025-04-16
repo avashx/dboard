@@ -702,7 +702,7 @@
         }
 
         async function fetchChartData() {
-            const baseUrl = window.location.hostname === 'localhost' ? 'http://localhost:3000' : 'https://bus-19wu.onrender.com';
+            const baseUrl = window.location.hostname === 'localhost' ? 'http://localhost:3000' : 'https://dboard-tzj3.onrender.com';
             try {
                 const response = await fetch(`${baseUrl}/api/analytics`, {
                     credentials: 'include'
@@ -892,7 +892,7 @@
                 const conductorWaiver = document.getElementById('conductorWaiver').value;
 
                 const payload = { busNo, routeNo, conductorId, conductorWaiver };
-                const baseUrl = window.location.hostname === 'localhost' ? 'http://localhost:3000' : 'https://bus-19wu.onrender.com';
+                const baseUrl = window.location.hostname === 'localhost' ? 'http://localhost:3000' : 'https://dboard-tzj3.onrender.com';
                 try {
                     const response = await fetch(`${baseUrl}/api/recordAttendance`, {
                         method: 'POST',
@@ -1066,7 +1066,7 @@
                 initialBusStops.slice(0, 3)
             );
 
-            const baseUrl = window.location.hostname === 'localhost' ? 'http://localhost:3000' : 'https://bus-19wu.onrender.com';
+            const baseUrl = window.location.hostname === 'localhost' ? 'http://localhost:3000' : 'https://dboard-tzj3.onrender.com';
             try {
                 const response = await fetch(`${baseUrl}/api/checkBus`, {
                     method: 'POST',
@@ -1141,7 +1141,7 @@
         }
 
         async function fetchRouteCompletions(busNo, routeName) {
-            const baseUrl = window.location.hostname === 'localhost' ? 'http://localhost:3000' : 'https://bus-19wu.onrender.com';
+            const baseUrl = window.location.hostname === 'localhost' ? 'http://localhost:3000' : 'https://dboard-tzj3.onrender.com';
             try {
                 const response = await fetch(`${baseUrl}/api/routeCompletions?busNo=${busNo}&routeName=${routeName}`, {
                     credentials: 'include'
