@@ -1,78 +1,97 @@
 const express = require('express');
-const cors = require('cors');
+const mongoose = require('mongoose');
+const socketIo = require('socket.io');
 const http = require('http');
-const { Server } = require('socket.io');
+const cors = require('cors');
+const path = require('path');
 const axios = require('axios');
 const protobuf = require('protobufjs');
 const fs = require('fs');
 const csv = require('csv-parse');
-const { MongoClient } = require('mongodb');
-require('dotenv').config();
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
-
-// CORS configuration
-const corsOptions = {
-    origin: function (origin, callback) {
-        const allowedOrigins = [
-            'https://bus-19wu.onrender.com', // Frontend URL
-            'http://localhost:3000'          // For local testing
-        ];
-        if (!origin || allowedOrigins.includes(origin)) {
-            callback(null, true);
-        } else {
-            callback(new Error('Not allowed by CORS'));
-        }
-    },
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true,
-    optionsSuccessStatus: 200 // For legacy browsers
-};
-
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions)); // Handle preflight requests for all routes
-
-app.use(express.static('public'));
-app.use(express.json());
-app.set('view engine', 'ejs');
-
-// MongoDB Connection with Retry Logic
-const uri = process.env.MONGODB_URI || 'mongodb+srv://ticketchecker:lq2MvkxmjWn8c8Ot@cluster0.daitar2.mongodb.net/busTrackerDB?retryWrites=true&w=majority';
-const client = new MongoClient(uri);
-let db;
-
-async function connectDB() {
-  let retries = 5;
-  while (retries) {
-    try {
-      await client.connect();
-      db = client.db('busTrackerDB');
-      console.log('Successfully connected to MongoDB');
-      break;
-    } catch (err) {
-      console.error('MongoDB connection error:', err.message);
-      retries -= 1;
-      if (retries === 0) {
-        console.error('Max retries reached. Could not connect to MongoDB.');
-        process.exit(1);
-      }
-      console.log(`Retrying connection (${5 - retries}/5)...`);
-      await new Promise(resolve => setTimeout(resolve, 5000));
+const io = socketIo(server, {
+    cors: {
+        origin: '*',
+        methods: ['GET', 'POST']
     }
-  }
+});
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'views'));
+
+// MongoDB Connection
+mongoose.connect('mongodb://localhost:27017/busTracker', {
+    useNewUrlParser: true,
+    useUnifiedTopology: true
+}).then(() => {
+    console.log('Connected to MongoDB');
+}).catch(err => {
+    console.error('MongoDB connection error:', err);
+});
+
+// Schemas
+const busSchema = new mongoose.Schema({
+    busNo: String,
+    latitude: Number,
+    longitude: Number,
+    routeNo: String,
+    routeName: String,
+    checked: Boolean,
+    stopsRemaining: Number,
+    mileage: Number,
+    ticketRevenue: Number,
+    fineRevenue: Number,
+    lastUpdated: Date,
+    routeCompletions: { type: Number, default: 0 }
+});
+
+const busStopSchema = new mongoose.Schema({
+    stop_id: String,
+    name: String,
+    latitude: Number,
+    longitude: Number
+});
+
+const checkSchema = new mongoose.Schema({
+    busNo: String,
+    routeNo: String,
+    nonTicketHolders: Number,
+    fineCollected: Number,
+    lastStop: String,
+    timestamp: { type: Date, default: Date.now }
+});
+
+const attendanceSchema = new mongoose.Schema({
+    busNo: String,
+    routeNo: String,
+    conductorId: String,
+    conductorWaiver: String,
+    timestamp: { type: Date, default: Date.now }
+});
+
+const Bus = mongoose.model('Bus', busSchema);
+const BusStop = mongoose.model('BusStop', busStopSchema);
+const Check = mongoose.model('Check', checkSchema);
+const Attendance = mongoose.model('Attendance', attendanceSchema);
+
+// GTFS-realtime Setup
+const protoFile = 'gtfs-realtime.proto';
+let FeedMessage;
+try {
+    const root = protobuf.loadSync(protoFile);
+    FeedMessage = root.lookupType('transit_realtime.FeedMessage');
+} catch (err) {
+    console.error('Error loading protobuf file:', err);
+    process.exit(1);
 }
 
-// Load GTFS-realtime proto file
-const protoFile = 'gtfs-realtime.proto';
-const root = protobuf.loadSync(protoFile);
-const FeedMessage = root.lookupType('transit_realtime.FeedMessage');
-
-// GTFS API endpoint
-const url = 'https://otd.delhi.gov.in/api/realtime/VehiclePositions.pb?key=7pnJf5w6MCh0JWrdisnafk0YhnKfUqxx';
-
+const gtfsUrl = 'https://otd.delhi.gov.in/api/realtime/VehiclePositions.pb?key=7pnJf5w6MCh0JWrdisnafk0YhnKfUqxx';
 let busData = [];
 let busStops = [];
 let routeMap = new Map();
@@ -81,278 +100,458 @@ const ZOOM_THRESHOLD = 14;
 
 // Parse CSV data
 const parseCSV = (csvString) => {
-  return new Promise((resolve, reject) => {
-    const data = [];
-    csv.parse(csvString, { columns: true, skip_empty_lines: true })
-      .on('data', (row) => data.push(row))
-      .on('end', () => resolve(data))
-      .on('error', (err) => reject(err));
-  });
+    return new Promise((resolve, reject) => {
+        const data = [];
+        csv.parse(csvString, { columns: true, skip_empty_lines: true })
+            .on('data', (row) => data.push(row))
+            .on('end', () => resolve(data))
+            .on('error', (err) => reject(err));
+    });
 };
 
-// Read and parse stops CSV
-const stopsCsvFilePath = 'data/stops.csv';
-const stopsCsvString = fs.readFileSync(stopsCsvFilePath, 'utf8');
-parseCSV(stopsCsvString)
-  .then(stops => {
-    busStops = stops.map(row => ({
-      name: row.stop_name || 'Unknown Stop',
-      latitude: parseFloat(row.stop_lat),
-      longitude: parseFloat(row.stop_lon)
-    }));
-    console.log(`Parsed ${busStops.length} bus stops from CSV`);
-  })
-  .catch(err => console.error('Error parsing stops CSV:', err));
+// Initialize bus stops from CSV
+const initializeBusStops = async () => {
+    try {
+        const stopsCsvString = fs.readFileSync('data/stops.csv', 'utf8');
+        const stops = await parseCSV(stopsCsvString);
+        busStops = stops.map(row => ({
+            stop_id: row.stop_id,
+            name: row.stop_name || 'Unknown Stop',
+            latitude: parseFloat(row.stop_lat),
+            longitude: parseFloat(row.stop_lon)
+        }));
+        console.log(`Parsed ${busStops.length} bus stops from CSV`);
 
-// Read and parse routename CSV
-const routeCsvFilePath = 'data/routename.csv';
-const routeCsvString = fs.readFileSync(routeCsvFilePath, 'utf8');
-parseCSV(routeCsvString)
-  .then(routes => {
-    routes.forEach(row => routeMap.set(row.route_id, row.route_name));
-    console.log(`Parsed ${routeMap.size} routes from routename.csv`);
-  })
-  .catch(err => console.error('Error parsing routename CSV:', err));
+        // Save to MongoDB if collection is empty
+        const count = await BusStop.countDocuments();
+        if (count === 0) {
+            await BusStop.insertMany(busStops);
+            console.log('Initialized bus stops in MongoDB');
+        } else {
+            // Update existing stops
+            for (const stop of busStops) {
+                await BusStop.updateOne(
+                    { stop_id: stop.stop_id },
+                    { $set: { name: stop.name, latitude: stop.latitude, longitude: stop.longitude } },
+                    { upsert: true }
+                );
+            }
+            console.log('Updated bus stops in MongoDB');
+        }
+    } catch (err) {
+        console.error('Error parsing stops.csv:', err);
+    }
+};
 
-// Function to calculate distance between two coordinates
+// Initialize routes from CSV
+const initializeRoutes = async () => {
+    try {
+        const routeCsvString = fs.readFileSync('data/routename.csv', 'utf8');
+        const routes = await parseCSV(routeCsvString);
+        routes.forEach(row => routeMap.set(row.route_id, row.route_name));
+        console.log(`Parsed ${routeMap.size} routes from routename.csv`);
+    } catch (err) {
+        console.error('Error parsing routename.csv:', err);
+    }
+};
+
+// Calculate distance between coordinates
 function calculateDistance(lat1, lon1, lat2, lon2) {
-  const R = 6371; // Radius of Earth in kilometers
-  const dLat = (lat2 - lat1) * Math.PI / 180;
-  const dLon = (lon2 - lon1) * Math.PI / 180;
-  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
-    Math.sin(dLon / 2) * Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
+    const R = 6371; // Radius in km
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+        Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
 }
 
-// Fetch bus data with retry logic and automatic stopsRemaining updates
+// Fetch GTFS-realtime bus data
 const fetchBusData = async () => {
-  let retries = 3;
-  while (retries) {
-    try {
-      const response = await axios.get(url, { responseType: 'arraybuffer' });
-      const buffer = response.data;
-      const message = FeedMessage.decode(new Uint8Array(buffer));
-      const data = FeedMessage.toObject(message, { longs: String, enums: String, bytes: String });
+    let retries = 3;
+    while (retries) {
+        try {
+            const response = await axios.get(gtfsUrl, { responseType: 'arraybuffer' });
+            const buffer = response.data;
+            const message = FeedMessage.decode(new Uint8Array(buffer));
+            const data = FeedMessage.toObject(message, { longs: String, enums: String, bytes: String });
 
-      const newBusData = data.entity
-        .filter(entity => entity.vehicle && entity.vehicle.position)
-        .map(entity => ({
-          busNo: entity.vehicle.vehicle.id || 'Unknown',
-          routeNo: entity.vehicle.trip?.routeId || 'Unknown',
-          routeName: routeMap.get(entity.vehicle.trip?.routeId) || entity.vehicle.trip?.routeId || 'Unknown',
-          latitude: entity.vehicle.position.latitude,
-          longitude: entity.vehicle.position.longitude,
-          checked: false, // Default value
-          stopsRemaining: 0 // Default value
+            const newBusData = data.entity
+                .filter(entity => entity.vehicle && entity.vehicle.position)
+                .map(entity => {
+                    const busNo = entity.vehicle.vehicle.id || `BUS${Math.floor(Math.random() * 10000)}`;
+                    const routeId = entity.vehicle.trip?.routeId || 'UNKNOWN';
+                    return {
+                        busNo,
+                        routeNo: routeId,
+                        routeName: routeMap.get(routeId) || routeId,
+                        latitude: entity.vehicle.position.latitude,
+                        longitude: entity.vehicle.position.longitude,
+                        checked: false,
+                        stopsRemaining: 10,
+                        mileage: 1.75,
+                        ticketRevenue: 0,
+                        fineRevenue: 0,
+                        lastUpdated: new Date(),
+                        routeCompletions: 0
+                    };
+                });
+
+            // Merge with MongoDB data
+            const dbBuses = await Bus.find();
+            for (const bus of newBusData) {
+                const dbBus = dbBuses.find(b => b.busNo === bus.busNo);
+                if (dbBus) {
+                    bus.checked = dbBus.checked;
+                    bus.stopsRemaining = dbBus.stopsRemaining;
+                    bus.mileage = dbBus.mileage;
+                    bus.ticketRevenue = dbBus.ticketRevenue;
+                    bus.fineRevenue = dbBus.fineRevenue;
+                    bus.routeCompletions = dbBus.routeCompletions;
+                }
+
+                // Update stopsRemaining based on stop proximity
+                const nearestStop = busStops.find(stop =>
+                    calculateDistance(bus.latitude, bus.longitude, stop.latitude, stop.longitude) < 0.05
+                );
+
+                if (nearestStop && bus.checked) {
+                    const existingCheck = await Check.findOne({ busNo: bus.busNo });
+                    const lastStop = existingCheck ? existingCheck.lastStop : null;
+                    if (lastStop !== nearestStop.name) {
+                        bus.stopsRemaining = Math.max(0, bus.stopsRemaining - 1);
+                        if (bus.stopsRemaining === 0) {
+                            bus.checked = false;
+                            bus.routeCompletions += 1;
+                            console.log(`Bus ${bus.busNo} completed route ${bus.routeName}, completions: ${bus.routeCompletions}`);
+                        }
+                        await Check.updateOne(
+                            { busNo: bus.busNo },
+                            { $set: { lastStop: nearestStop.name, timestamp: new Date() } },
+                            { upsert: true }
+                        );
+                        await Bus.updateOne(
+                            { busNo: bus.busNo },
+                            {
+                                $set: {
+                                    stopsRemaining: bus.stopsRemaining,
+                                    checked: bus.checked,
+                                    routeCompletions: bus.routeCompletions,
+                                    lastUpdated: new Date()
+                                }
+                            },
+                            { upsert: true }
+                        );
+                        console.log(`Bus ${bus.busNo} at ${nearestStop.name}, stopsRemaining: ${bus.stopsRemaining}`);
+                    }
+                }
+            }
+
+            busData = newBusData;
+            console.log(`Fetched ${busData.length} buses`);
+
+            // Emit to clients
+            io.sockets.sockets.forEach((socket) => {
+                const zoomLevel = clientZoomLevels.get(socket.id) || 0;
+                const updateData = { buses: busData };
+                if (zoomLevel >= ZOOM_THRESHOLD) {
+                    updateData.busStops = busStops;
+                }
+                socket.emit('busUpdate', updateData);
+            });
+
+            // Persist to MongoDB
+            for (const bus of busData) {
+                await Bus.updateOne(
+                    { busNo: bus.busNo },
+                    {
+                        $set: {
+                            latitude: bus.latitude,
+                            longitude: bus.longitude,
+                            routeNo: bus.routeNo,
+                            routeName: bus.routeName,
+                            checked: bus.checked,
+                            stopsRemaining: bus.stopsRemaining,
+                            mileage: bus.mileage,
+                            ticketRevenue: bus.ticketRevenue,
+                            fineRevenue: bus.fineRevenue,
+                            routeCompletions: bus.routeCompletions,
+                            lastUpdated: bus.lastUpdated
+                        }
+                    },
+                    { upsert: true }
+                );
+            }
+
+            break;
+        } catch (error) {
+            console.error('Error fetching GTFS data:', error.message);
+            retries--;
+            if (retries === 0) {
+                console.error('Max retries reached for GTFS fetch.');
+                break;
+            }
+            await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+    }
+};
+
+// Routes
+app.get('/', async (req, res) => {
+    try {
+        const buses = await Bus.find();
+        const busStops = await BusStop.find();
+        res.render('index', { buses, busStops });
+    } catch (err) {
+        console.error('Error rendering index:', err);
+        res.status(500).send('Server Error');
+    }
+});
+
+app.get('/api/buses', async (req, res) => {
+    try {
+        const buses = await Bus.find();
+        res.json(buses);
+    } catch (err) {
+        console.error('Error fetching buses:', err);
+        res.status(500).json({ error: 'Server Error' });
+    }
+});
+
+app.get('/api/busStops', async (req, res) => {
+    try {
+        const busStops = await BusStop.find();
+        res.json(busStops);
+    } catch (err) {
+        console.error('Error fetching bus stops:', err);
+        res.status(500).json({ error: 'Server Error' });
+    }
+});
+
+app.get('/api/analytics', async (req, res) => {
+    try {
+        const buses = await Bus.find();
+        const checks = await Check.find();
+        const attendances = await Attendance.find();
+
+        const revenuePerBus = buses.map(bus => ({
+            busNo: bus.busNo,
+            revenue: (bus.ticketRevenue || 0) + (bus.fineRevenue || 0)
         }));
 
-      if (db) {
-        const checkedBuses = await db.collection('busChecks').find({}).toArray();
-
-        for (const bus of newBusData) {
-          const existingBus = busData.find(b => b.busNo === bus.busNo);
-          const check = checkedBuses.find(cb => cb.busNo === bus.busNo);
-
-          // Initialize from DB if available
-          if (check) {
-            bus.checked = check.checked;
-            bus.stopsRemaining = check.stopsRemaining || 0;
-            bus.nonTicketHolders = check.nonTicketHolders || 0;
-            bus.fineCollected = check.fineCollected || 0;
-          }
-
-          // Check proximity to stops and update stopsRemaining automatically
-          const nearestStop = busStops.find(stop => 
-            calculateDistance(bus.latitude, bus.longitude, stop.latitude, stop.longitude) < 0.05
-          );
-
-          if (nearestStop && bus.checked) {
-            const lastStop = check ? check.lastStop : null;
-            if (lastStop !== nearestStop.name) {
-              // Bus has moved to a new stop, decrement stopsRemaining
-              const newStopsRemaining = Math.max(0, bus.stopsRemaining - 1);
-              await db.collection('busChecks').updateOne(
-                { busNo: bus.busNo },
-                { 
-                  $set: { 
-                    stopsRemaining: newStopsRemaining, 
-                    lastStop: nearestStop.name,
-                    checked: newStopsRemaining > 0, // Uncheck if stopsRemaining reaches 0
-                    timestamp: new Date()
-                  } 
-                },
-                { upsert: true }
-              );
-              bus.stopsRemaining = newStopsRemaining;
-              bus.checked = newStopsRemaining > 0;
-              console.log(`Bus ${bus.busNo} moved to ${nearestStop.name}, stopsRemaining: ${bus.stopsRemaining}`);
+        const revenuePerRoute = buses.reduce((acc, bus) => {
+            const route = acc.find(r => r.routeName === bus.routeName);
+            if (route) {
+                route.revenue += (bus.ticketRevenue || 0) + (bus.fineRevenue || 0);
+            } else {
+                acc.push({
+                    routeName: bus.routeName,
+                    revenue: (bus.ticketRevenue || 0) + (bus.fineRevenue || 0)
+                });
             }
-          }
-        }
-      }
+            return acc;
+        }, []);
 
-      busData = newBusData;
-      console.log(`Fetched and updated ${busData.length} buses`);
+        const dtcLoss = checks.map(check => ({
+            date: check.timestamp.toISOString().split('T')[0],
+            loss: check.nonTicketHolders * 50
+        }));
 
-      // Emit updated bus data to all connected clients
-      io.sockets.sockets.forEach((socket) => {
-        const zoomLevel = clientZoomLevels.get(socket.id) || 0;
-        const updateData = { buses: busData };
-        if (zoomLevel >= ZOOM_THRESHOLD) updateData.busStops = busStops;
-        socket.emit('busUpdate', updateData);
-      });
-      break;
-    } catch (error) {
-      console.error('Error fetching bus data:', error.message);
-      retries -= 1;
-      if (retries === 0) {
-        console.error('Max retries reached for GTFS fetch.');
-        break;
-      }
-      console.log(`Retrying GTFS fetch (${3 - retries}/3)...`);
-      await new Promise(resolve => setTimeout(resolve, 2000));
+        const mileagePerBus = buses.map(bus => ({
+            busNo: bus.busNo,
+            mileage: bus.mileage || 1.75
+        }));
+
+        const costPerBus = buses.map(bus => ({
+            busNo: bus.busNo,
+            cost: (bus.mileage ? (1000 / bus.mileage) : 0) + 500
+        }));
+
+        const defaultersPerBus = checks.reduce((acc, check) => {
+            const bus = acc.find(b => b.busNo === check.busNo);
+            const busData = buses.find(b => b.busNo === check.busNo);
+            if (bus) {
+                bus.nonTicketHolders += check.nonTicketHolders;
+            } else {
+                acc.push({
+                    busNo: check.busNo,
+                    nonTicketHolders: check.nonTicketHolders,
+                    latitude: busData ? busData.latitude : 28.6139,
+                    longitude: busData ? busData.longitude : 77.2090
+                });
+            }
+            return acc;
+        }, []);
+
+        const routeCompletions = buses.map(bus => ({
+            busNo: bus.busNo,
+            routeName: bus.routeName,
+            completions: bus.routeCompletions || 0
+        }));
+
+        const totalBuses = buses.length;
+        const totalStaff = attendances.length;
+        const totalFineCollected = checks.reduce((sum, check) => sum + (check.fineCollected || 0), 0);
+        const totalRevenue = revenuePerBus.reduce((sum, bus) => sum + bus.revenue, 0);
+        const breakdownBuses = buses.filter(bus => bus.mileage < 1).length;
+
+        res.json({
+            revenuePerBus,
+            revenuePerRoute,
+            dtcLoss,
+            mileagePerBus,
+            costPerBus,
+            defaultersPerBus,
+            routeCompletions,
+            totalBuses,
+            totalStaff,
+            totalFineCollected,
+            totalRevenue,
+            breakdownBuses
+        });
+    } catch (err) {
+        console.error('Error fetching analytics:', err);
+        res.status(500).json({ error: 'Server Error' });
     }
-  }
-};
-
-setInterval(fetchBusData, 1000);
-
-// Serve webpage
-app.get('/', async (req, res) => {
-  if (db) {
-    const checkedBuses = await db.collection('busChecks').find({}).toArray();
-    busData.forEach(bus => {
-      const check = checkedBuses.find(cb => cb.busNo === bus.busNo);
-      if (check) {
-        bus.stopsRemaining = check.stopsRemaining || 0;
-        bus.checked = check.checked;
-        bus.nonTicketHolders = check.nonTicketHolders || 0;
-        bus.fineCollected = check.fineCollected || 0;
-      }
-    });
-  }
-  res.render('index', { buses: busData, busStops: [] });
 });
 
-// API to update bus check status
-app.post('/api/checkBus', async (req, res) => {
-  console.log('Received /api/checkBus request:', req.body);
-  const { busNo, routeNo, nonTicketHolders, fineCollected } = req.body;
-
-  if (!busNo || !routeNo || nonTicketHolders === undefined || fineCollected === undefined) {
-    console.error('Invalid request body:', req.body);
-    return res.status(400).json({ success: false, error: 'Missing required fields' });
-  }
-
-  if (!db) {
-    console.error('Database not connected');
-    return res.status(503).json({ success: false, error: 'Database not connected. Please try again later.' });
-  }
-
-  try {
-    const result = await db.collection('busChecks').updateOne(
-      { busNo },
-      { 
-        $set: { 
-          routeNo, 
-          checked: true, 
-          nonTicketHolders, 
-          fineCollected, 
-          stopsRemaining: 10, 
-          lastStop: null, 
-          timestamp: new Date() 
-        } 
-      },
-      { upsert: true }
-    );
-    console.log('Bus check updated:', result);
-
-    // Update busData immediately and emit to clients
-    const bus = busData.find(b => b.busNo === busNo);
-    if (bus) {
-      bus.checked = true;
-      bus.stopsRemaining = 10;
-      bus.nonTicketHolders = nonTicketHolders;
-      bus.fineCollected = fineCollected;
+app.get('/api/routeCompletions', async (req, res) => {
+    try {
+        const { busNo, routeName } = req.query;
+        const bus = await Bus.findOne({ busNo, routeName });
+        res.json({ completions: bus ? bus.routeCompletions : 0 });
+    } catch (err) {
+        console.error('Error fetching route completions:', err);
+        res.status(500).json({ error: 'Server Error' });
     }
-    io.emit('busUpdate', { buses: busData, busStops: clientZoomLevels.size > 0 && Math.max(...clientZoomLevels.values()) >= ZOOM_THRESHOLD ? busStops : [] });
-
-    res.json({ success: true, result });
-  } catch (err) {
-    console.error('Error in /api/checkBus:', err.message);
-    res.status(500).json({ success: false, error: err.message });
-  }
 });
 
-// API to record bus attendance
 app.post('/api/recordAttendance', async (req, res) => {
-  console.log('Received /api/recordAttendance request:', req.body);
-  const { busNo, routeNo, conductorId, conductorWaiver } = req.body;
-
-  if (!busNo || !routeNo || !conductorId || !conductorWaiver) {
-    console.error('Invalid request body:', req.body);
-    return res.status(400).json({ success: false, error: 'Missing required fields' });
-  }
-
-  if (!db) {
-    console.error('Database not connected');
-    return res.status(503).json({ success: false, error: 'Database not connected. Please try again later.' });
-  }
-
-  try {
-    const result = await db.collection('busAttendance').insertOne({
-      busNo,
-      routeNo,
-      conductorId,
-      conductorWaiver,
-      timestamp: new Date()
-    });
-    console.log('Attendance recorded:', result);
-    res.json({ success: true, result });
-  } catch (err) {
-    console.error('Error in /api/recordAttendance:', err.message);
-    res.status(500).json({ success: false, error: err.message });
-  }
+    try {
+        const { busNo, routeNo, conductorId, conductorWaiver } = req.body;
+        if (!busNo || !routeNo || !conductorId || !conductorWaiver) {
+            return res.status(400).json({ success: false, error: 'Missing required fields' });
+        }
+        const attendance = new Attendance({
+            busNo,
+            routeNo,
+            conductorId,
+            conductorWaiver
+        });
+        await attendance.save();
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error recording attendance:', err);
+        res.status(500).json({ success: false, error: 'Server Error' });
+    }
 });
 
-// Socket connections
+app.post('/api/checkBus', async (req, res) => {
+    try {
+        const { busNo, routeNo, nonTicketHolders, fineCollected } = req.body;
+        if (!busNo || !routeNo || nonTicketHolders === undefined || fineCollected === undefined) {
+            return res.status(400).json({ success: false, error: 'Missing required fields' });
+        }
+
+        const check = new Check({
+            busNo,
+            routeNo,
+            nonTicketHolders,
+            fineCollected
+        });
+        await check.save();
+
+        // Update bus in MongoDB
+        await Bus.updateOne(
+            { busNo, routeNo },
+            {
+                $set: {
+                    checked: true,
+                    fineRevenue: fineCollected || 0,
+                    stopsRemaining: 10,
+                    lastUpdated: new Date()
+                }
+            }
+        );
+
+        // Update in-memory busData
+        const bus = busData.find(b => b.busNo === busNo);
+        if (bus) {
+            bus.checked = true;
+            bus.fineRevenue = fineCollected || 0;
+            bus.stopsRemaining = 10;
+        }
+
+        // Emit update to clients
+        io.sockets.sockets.forEach((socket) => {
+            const zoomLevel = clientZoomLevels.get(socket.id) || 0;
+            const updateData = { buses: busData };
+            if (zoomLevel >= ZOOM_THRESHOLD) {
+                updateData.busStops = busStops;
+            }
+            socket.emit('busUpdate', updateData);
+        });
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error checking bus:', err);
+        res.status(500).json({ success: false, error: 'Server Error' });
+    }
+});
+
+// Socket.IO Connections
 io.on('connection', (socket) => {
-  console.log('Client connected:', socket.id);
-  socket.on('zoomLevel', (zoom) => {
-    clientZoomLevels.set(socket.id, zoom);
-    const updateData = { buses: busData };
-    if (zoom >= ZOOM_THRESHOLD) updateData.busStops = busStops;
-    socket.emit('busUpdate', updateData);
-  });
-  socket.on('disconnect', () => {
-    clientZoomLevels.delete(socket.id);
-    console.log('Client disconnected:', socket.id);
-  });
+    console.log('Client connected:', socket.id);
+    socket.on('zoomLevel', (zoom) => {
+        clientZoomLevels.set(socket.id, zoom);
+        const updateData = { buses: busData };
+        if (zoom >= ZOOM_THRESHOLD) {
+            updateData.busStops = busStops;
+        }
+        socket.emit('busUpdate', updateData);
+    });
+    socket.on('disconnect', () => {
+        clientZoomLevels.delete(socket.id);
+        console.log('Client disconnected:', socket.id);
+    });
 });
 
-// Start server
-async function startServer() {
-  await connectDB();
-  const PORT = process.env.PORT || 3000;
-  server.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-    fetchBusData();
-  });
-}
+// Initialize and Start
+const startServer = async () => {
+    try {
+        await initializeBusStops();
+        await initializeRoutes();
+        await fetchBusData();
+        setInterval(fetchBusData, 5000); // Fetch every 5 seconds to balance performance
+
+        const PORT = process.env.PORT || 3000;
+        server.listen(PORT, () => {
+            console.log(`Server running on port ${PORT}`);
+        });
+    } catch (err) {
+        console.error('Failed to start server:', err);
+        process.exit(1);
+    }
+};
 
 startServer();
 
 // Graceful shutdown
 process.on('SIGTERM', async () => {
-  console.log('SIGTERM received. Closing MongoDB connection...');
-  await client.close();
-  process.exit(0);
+    console.log('SIGTERM received. Closing MongoDB connection...');
+    await mongoose.connection.close();
+    server.close(() => {
+        console.log('Server closed.');
+        process.exit(0);
+    });
 });
 
 process.on('SIGINT', async () => {
-  console.log('SIGINT received. Closing MongoDB connection...');
-  await client.close();
-  process.exit(0);
+    console.log('SIGINT received. Closing MongoDB connection...');
+    await mongoose.connection.close();
+    server.close(() => {
+        console.log('Server closed.');
+        process.exit(0);
+    });
 });
